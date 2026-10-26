@@ -1,0 +1,20 @@
+{
+  "name": "Example Bot",
+  "type": "personal_chat",
+  "id": 12345,
+  "messages": [
+    {
+      "id": 42,
+      "type": "message",
+      "date": "2026-08-01T03:30:00",
+      "date_unixtime": "1785555000",
+      "from": "Rick",
+      "from_id": "user123",
+      "text": "Ship the MVP",
+      "reply_to_message_id": 40,
+      "forwarded_from": "A colleague",
+      "file": "files/brief.pdf",
+      "media_type": "document"
+    }
+  ]
+}

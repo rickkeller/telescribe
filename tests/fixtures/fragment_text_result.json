@@ -1,0 +1,19 @@
+{
+  "name": "Example Owner Hermes",
+  "messages": [
+    {
+      "id": 7,
+      "type": "message",
+      "date": "2026-08-01T04:00:00",
+      "date_unixtime": "1785556800",
+      "from": "Hermes",
+      "text": [
+        "Read ",
+        {"type": "link", "text": "the spec", "href": "https://example.test/spec"},
+        " and ",
+        {"type": "bold", "text": "reply"}
+      ],
+      "photo": "photos/pic.jpg"
+    }
+  ]
+}
