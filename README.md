@@ -1,64 +1,100 @@
 # TeleScribe
 
-TeleScribe is a local-first, deterministic Telegram Desktop JSON daily archiver for Obsidian-compatible Markdown. This first MVP slice supports configuration, JSON parsing/normalization, stable message identities, a SQLite checkpoint index, local `America/New_York` daily archives, dry-run, and a rollback-capable filesystem/state commit boundary.
+TeleScribe turns **Telegram Desktop JSON chat exports** into **one Markdown note per day**, ready for an Obsidian vault. It runs locally and gives the same output for the same input. Run it on the same export as often as you like: a SQLite index remembers which messages are already archived, so only new or late messages change any notes.
 
-It does not send network requests by default, automatically classify or extract content, copy attachments, watch exports, write canonical project notes, or modify Telegram exports.
+What it does **not** do by default: send network requests, classify content, copy attachments, watch for new exports, write project notes, or modify your Telegram export. An optional model-assisted review step is off by default (see [docs/intelligence.md](docs/intelligence.md)).
 
-Phase 2B retains the disabled-by-default, review-only boundary and adds one direct opt-in adapter: `deepseek` / `deepseek-v4-flash`. It is used only with enabled matching configuration, the environment-only `TELESCRIBE_DEEPSEEK_API_KEY`, and an explicit `review --dispatch`; no credential, endpoint, transport, timeout, project list, or arbitrary provider setting can appear in YAML or the public factory. The factory constructs the fixed stdlib HTTPS destination internally. The model receives only bounded/redacted indexed evidence plus selectively retrieved approved project context. This retrieval-only context remains limited to regular, non-symlink files under the separate explicit `intelligence.project_context_root`, structurally disjoint from `archive_root` and excluding every configured Telegram export (enabled or disabled, including hardlinks). For remote dispatch, context is narrower still: only intentional `.md` and `.txt` project notes are allowed. Dotfiles, `.env`, config/settings, logs, SQLite/state/WAL/SHM databases, audit/run material, raw exports/results (including JSON), and all other file types are rejected rather than transformed. After redaction, any evidence or context containing an absolute path, secret assignment, operational-storage term, or raw-export indicator also rejects the request before transport. It never receives Hermes memory or session transcripts. The adapter cannot edit canonical project notes, tasks, ideas, decisions, archives, indexes, or checkpoints; successful review may write only its proposal queue and redacted audit.
+It is a vault archive, not chat memory.
 
-## Requirements and setup
+## Requirements
 
-Python 3.12 and [uv](https://docs.astral.sh/uv/) are required.
+- Python 3.12 or newer.
+- [uv](https://docs.astral.sh/uv/).
+- A Telegram Desktop export in **JSON** format. In Telegram Desktop, open a chat, choose **⋮ → Export chat history**, and set *Format* to **Machine-readable JSON**. You get a folder with `result.json` (and `files/` if you exported media).
+
+## Install
 
 ```bash
+git clone https://github.com/rickkeller/telescribe
+cd telescribe
 uv sync --python 3.12
-uv run pytest
+uv run telescribe --help
 ```
 
-Use a YAML configuration such as:
+During install, uv may warn about the `uv_build` version pin. It's harmless when the sync succeeds.
 
-```yaml
-archive_root: /safe/output/telegram-archive
-state_path: /safe/output/.hermes-telegram-archive/state.sqlite3
-timezone: America/New_York
-sources:
-  - id: example_bot
-    telegram_names: [Example Bot]
-    export_path: /exports/example_bot/result.json
-    attachment_dir: /exports/example_bot/files
-    enabled: true
-intelligence:
-  enabled: true
-  provider: deepseek
-  model: deepseek-v4-flash
-  review_queue_root: /safe/output/review-queue
-  project_context_root: /safe/project-context
-  projects:
-    - id: example
-      context_paths: [brief.md]
-```
+## Quickstart
 
-Run a mutation-free plan first, then archive:
+1. Note the chat name at the top of `result.json` (the `"name"` field). TeleScribe only processes an export whose name you list.
+2. Create `telescribe.yaml`:
 
-```bash
-uv run telescribe process --config telescribe.yaml --dry-run
-uv run telescribe validate --config telescribe.yaml
-uv run telescribe process --config telescribe.yaml
-uv run telescribe reprocess --config telescribe.yaml --date 2026-07-31
-uv run telescribe reprocess --config telescribe.yaml --source example_bot
-uv run telescribe reprocess --config telescribe.yaml --all
-uv run telescribe status --config telescribe.yaml
-```
+   ```yaml
+   archive_root: /path/to/ObsidianVault          # where daily notes are written
+   state_path: /path/to/telescribe-state/state.sqlite3
+   timezone: America/New_York                    # used to split messages into days
+   sources:
+     - id: my_chat                               # your own stable ID (no spaces)
+       telegram_names: ["My Chat"]               # must match "name" in result.json
+       export_path: /path/to/export/result.json
+       attachment_dir: /path/to/export/files
+       enabled: true
+   ```
 
-Direct review dispatch is deliberately separate from ordinary review and dry runs. Set the credential outside YAML, then use this preflight (it checks only whether the variable exists, never prints its value) before a live dispatch:
+3. Check it, preview it, then run it:
 
-```bash
-if [ -z "${TELESCRIBE_DEEPSEEK_API_KEY+x}" ]; then
-  echo "TELESCRIBE_DEEPSEEK_API_KEY is not set" >&2
-  exit 1
-fi
-uv run telescribe review --config telescribe.yaml --all --dispatch
-```
+   ```bash
+   uv run telescribe validate --config telescribe.yaml          # parses exports, checks paths, writes nothing
+   uv run telescribe process  --config telescribe.yaml --dry-run
+   uv run telescribe process  --config telescribe.yaml
+   uv run telescribe status   --config telescribe.yaml
+   ```
+
+Notes are written to `<archive_root>/01 Daily Archives/Telegram/YYYY/YYYY-MM/YYYY-MM-DD.md`. When you get a newer export of the same chat, point `export_path` at it and run `process` again. Messages already in the index are skipped.
+
+To try it without a real export, use the sample at `tests/fixtures/string_text_result.json`. Its chat name is `Example Bot`.
+
+## Commands
+
+| Command | What it does |
+| --- | --- |
+| `process [--dry-run]` | Archive every new message. `--dry-run` lists the notes that would change and writes nothing. |
+| `reprocess --date YYYY-MM-DD` / `--source ID` / `--all` | Rebuild the chosen daily notes from the index. Pass exactly one selector. |
+| `status` | Show how many messages are indexed. |
+| `validate` | Parse every enabled export and check that output paths are writable, without writing. |
+| `review …` | Optional model-assisted review. See [docs/intelligence.md](docs/intelligence.md). |
+
+Every command needs `--config PATH`. Run `uv run telescribe <command> --help` for the options.
+
+## Configuration reference
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `archive_root` | required | Where the daily notes go, usually your Obsidian vault. |
+| `state_path` | `.hermes-telegram-archive/state.sqlite3` | SQLite index, which is the checkpoint. Keep it outside the vault, and back it up. |
+| `timezone` | `America/New_York` | IANA zone used to group messages into calendar days. |
+| `sources[].id` | required | Stable ID for this chat. No whitespace. Must be unique. |
+| `sources[].telegram_names` | required | Accepted export names. An export with any other name is refused. |
+| `sources[].export_path` | required | Path to `result.json`. |
+| `sources[].attachment_dir` | required | The export's media folder. TeleScribe doesn't copy attachments. |
+| `sources[].enabled` | `true` | Set to `false` to skip this source. |
+| `intelligence.*` | disabled | Optional review settings. See [docs/intelligence.md](docs/intelligence.md). |
+
+Secrets never go in YAML. A config file with a key named like a secret (`secret`, `password`, `credential`, `api_key`, `access_token`) is refused. The one optional credential, `TELESCRIBE_DEEPSEEK_API_KEY`, is read only from the environment and only for `review --dispatch`.
+
+## Troubleshooting
+
+- **`Invalid value for '--config': Path … does not exist`** (exit code 2): check the path you passed to `--config`.
+- **A long traceback ending in `ValueError: …`.** Errors are reported as Python tracebacks, so read the last line:
+  - `Telegram export name does not match configured names`: add the export's exact `"name"` value to `telegram_names`.
+  - `configured output parent is not writable`: create the parent folder of `archive_root` or `state_path`, or fix its permissions.
+  - `secrets are not permitted in YAML configuration`: remove any key whose name looks like a secret, such as `api_key`, `password` or `secret`.
+  - `Telegram export must contain a messages list`: that file isn't a JSON chat export.
+- **`uv sync` picks the wrong Python:** pass `--python 3.12` explicitly. If you're inside another virtualenv, uv warns that `VIRTUAL_ENV` doesn't match; run `deactivate` first.
+- **Offline, so `uv sync` can't download:** with the dependencies already installed, run `PYTHONPATH=src python3.12 -m pytest`, or `PYTHONPATH=src python3.12 -m telescribe.cli`.
+- **A note didn't change after a re-run:** that's expected when the export has no new messages. To force a rebuild, use `reprocess`.
+- **Messages land on the "wrong" day:** days are split in the configured `timezone`, not in UTC.
+
+## How it behaves
 
 The SQLite index is the checkpoint. Reprocessing an unchanged export yields zero new messages and no note rewrite. A newly observed late message causes its local calendar-day note to be rebuilt chronologically from the current export. Dry-run reports intended changed daily-note paths while making no filesystem or SQLite state changes. During a real run, file replacement is rolled back if the single SQLite index-and-terminal-status transaction fails.
 
@@ -72,7 +108,14 @@ Every archive record includes deterministic, recursively redacted original-sourc
 `validate` parses every enabled export and checks that archive/state output parents are writable, without creating archive files or state. Existing SQLite indexes are opened read-only for `--dry-run` and `status`.
 `reprocess` requires exactly one selector, `--date YYYY-MM-DD`, `--source ID`, or `--all`; it rebuilds only selected archive days exclusively from terminal indexed normalized records and never inserts message records. It can recreate a selected generated daily archive at a newly configured `archive_root`. A source selection rebuilds every selected day with all indexed records for that day. Every mutating run durably stages its privacy-safe audit before archive/state terminal commits. Failed runs roll files and state back and receive a best-effort bounded, redacted failure audit; dry runs write neither state nor audits, including for an existing empty SQLite placeholder.
 
-`review` uses the same exactly-one `--date` / `--source` / `--all` selector rule and supports `--dry-run`. Remote review is never automatic: `--dispatch` is required, and it is mutually exclusive with `--dry-run`. The CLI otherwise fails closed with a controlled non-secret error. Direct responses must contain only a bounded JSON `proposals` object and still pass the injected-service deterministic redaction/lineage/schema validation. Prompts, requests, and responses are never logged or persisted. A rejected remote payload performs no transport call and creates no queue or audit. Queue and redacted audit files commit as one rollback-protected outcome. A dry run makes no queue, audit, state, archive, or canonical-note changes.
+## Development
+
+```bash
+uv sync --python 3.12
+uv run pytest
+```
+
+See [AGENTS.md](AGENTS.md) for the layout and rules.
 
 ## Change Log
 
@@ -84,10 +127,6 @@ Every archive record includes deterministic, recursively redacted original-sourc
 
 - **2026-08-02:** Hardened Phase 2A review queues: strict calendar-date selectors; distinct, non-overlapping archive/review roots with symlink-safe queue paths; bounded evidence/context; redacted/revalidated model candidates; and atomic queue-plus-audit rollback behavior. The CLI remains deliberately provider-free and fails closed.
 
-## Exact verification command
+## License
 
-```bash
-PYTHONPATH=src python3.12 -m pytest
-```
-
-This fallback command is useful in offline environments where `uv sync` cannot download dependencies; the project itself is packaged for uv.
+MIT. See [LICENSE](LICENSE).
