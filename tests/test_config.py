@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from telescribe.config import AppConfig, IntelligenceConfig, ProjectConfig, SourceConfig
+from telescribe.daily_archiver import telegram_archive_output_root
 
 
 def test_source_config_requires_stable_id_and_paths() -> None:
@@ -58,14 +59,55 @@ def test_source_config_rejects_blank_accepted_telegram_name() -> None:
 
 @pytest.mark.parametrize("context, archive", [
     (Path("same"), Path("same")),
-    (Path("vault/context"), Path("vault")),
-    (Path("context"), Path("context/archive")),
+    (Path("vault/01 Daily Archives/Telegram/context"), Path("vault")),
+    (Path("context"), Path("context/01 Daily Archives/Telegram")),
 ])
-def test_config_rejects_project_context_root_archive_root_nesting(context: Path, archive: Path) -> None:
+def test_config_rejects_project_context_root_actual_archive_output_nesting(context: Path, archive: Path) -> None:
     source = SourceConfig(id="source", telegram_names=["Chat"], export_path=Path("result.json"), attachment_dir=Path("files"))
     with pytest.raises(ValueError, match="project_context_root and archive_root overlap"):
         AppConfig(sources=[source], archive_root=archive, intelligence=IntelligenceConfig(
             enabled=True, review_queue_root=Path("review"), project_context_root=context,
+            projects=[ProjectConfig(id="alpha")],
+        ))
+
+
+def test_config_allows_isolated_shadow_review_siblings_under_vault_base(tmp_path: Path) -> None:
+    vault = tmp_path / "Obsidian Vault"
+    source = SourceConfig(id="source", telegram_names=["Chat"], export_path=tmp_path / "result.json", attachment_dir=tmp_path / "files")
+
+    config = AppConfig(sources=[source], archive_root=vault, intelligence=IntelligenceConfig(
+        enabled=True,
+        review_queue_root=vault / "20-Review Queues" / "TeleScribe Shadow",
+        project_context_root=vault / "10-Projects" / "TeleScribe Shadow Context",
+        projects=[ProjectConfig(id="alpha")],
+    ))
+
+    assert telegram_archive_output_root(config.archive_root) == vault / "01 Daily Archives" / "Telegram"
+
+
+@pytest.mark.parametrize("root_name", ["review_queue_root", "project_context_root"])
+def test_config_rejects_actual_archive_output_and_vault_base_as_review_roots(tmp_path: Path, root_name: str) -> None:
+    vault = tmp_path / "Obsidian Vault"
+    source = SourceConfig(id="source", telegram_names=["Chat"], export_path=tmp_path / "result.json", attachment_dir=tmp_path / "files")
+    for unsafe_root in (vault, telegram_archive_output_root(vault), telegram_archive_output_root(vault) / "nested"):
+        roots = {
+            "review_queue_root": vault / "20-Review Queues" / "TeleScribe Shadow",
+            "project_context_root": vault / "10-Projects" / "TeleScribe Shadow Context",
+        }
+        roots[root_name] = unsafe_root
+        with pytest.raises(ValueError, match="overlap"):
+            AppConfig(sources=[source], archive_root=vault, intelligence=IntelligenceConfig(
+                enabled=True, **roots, projects=[ProjectConfig(id="alpha")],
+            ))
+
+
+def test_config_rejects_review_and_context_root_overlap(tmp_path: Path) -> None:
+    source = SourceConfig(id="source", telegram_names=["Chat"], export_path=tmp_path / "result.json", attachment_dir=tmp_path / "files")
+    shared = tmp_path / "Obsidian Vault" / "TeleScribe Shadow"
+
+    with pytest.raises(ValueError, match="review_queue_root and project_context_root must not overlap"):
+        AppConfig(sources=[source], archive_root=tmp_path / "Obsidian Vault", intelligence=IntelligenceConfig(
+            enabled=True, review_queue_root=shared, project_context_root=shared / "context",
             projects=[ProjectConfig(id="alpha")],
         ))
 
@@ -93,6 +135,37 @@ def test_config_rejects_archive_root_symlink_alias_before_outputs(tmp_path: Path
     assert not any(review.iterdir())
     assert not any(context.iterdir())
     assert not list(tmp_path.rglob("*.md"))
+
+
+@pytest.mark.parametrize(("component", "target_name"), [
+    ("01 Daily Archives", "review"),
+    ("Telegram", "context"),
+])
+def test_config_rejects_symlinked_archive_output_component_before_any_output(
+        tmp_path: Path, component: str, target_name: str) -> None:
+    """A generated-output component cannot alias an otherwise valid shadow sibling."""
+    vault = tmp_path / "Obsidian Vault"
+    review = vault / "20-Review Queues" / "TeleScribe Shadow"
+    context = vault / "10-Projects" / "TeleScribe Shadow Context"
+    review.mkdir(parents=True)
+    context.mkdir(parents=True)
+    daily_archives = vault / "01 Daily Archives"
+    linked = daily_archives if component == "01 Daily Archives" else daily_archives / "Telegram"
+    if linked.parent != vault:
+        linked.parent.mkdir()
+    linked.symlink_to(review if target_name == "review" else context, target_is_directory=True)
+    source = SourceConfig(id="source", telegram_names=["Chat"],
+                          export_path=tmp_path / "result.json", attachment_dir=tmp_path / "files")
+
+    with pytest.raises(ValueError, match="unsafe archive output symlink"):
+        AppConfig(sources=[source], archive_root=vault, intelligence=IntelligenceConfig(
+            enabled=True, review_queue_root=review, project_context_root=context,
+            projects=[ProjectConfig(id="alpha")],
+        ))
+
+    assert linked.is_symlink()
+    assert not list(review.iterdir())
+    assert not list(context.iterdir())
 
 
 @pytest.mark.parametrize("root_name", ["archive_root", "review_queue_root", "project_context_root"])

@@ -108,6 +108,18 @@ def test_review_cli_requires_one_selector_and_fails_closed_without_provider(tmp_
     assert not (tmp_path / "review").exists()
 
 
+def test_review_cli_exposes_bounded_page_options() -> None:
+    result = CliRunner().invoke(app, ["review", "--help"])
+
+    assert result.exit_code == 0
+    assert "--cursor" in result.output
+    assert "--offset" in result.output
+    assert "--batch-size" in result.output
+    assert "--chronological" in result.output
+    assert "--start-date" in result.output
+    assert "--end-date" in result.output
+
+
 def test_review_cli_dispatch_and_dry_run_are_mutually_exclusive(tmp_path: Path) -> None:
     config = _config_file(tmp_path)
     result = CliRunner().invoke(app, ["review", "--config", str(config), "--all", "--dry-run", "--dispatch"])

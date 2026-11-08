@@ -1,47 +1,40 @@
 # TeleScribe
 
-This repository is a local Telegram export archiver. It is a vault archive, not chat memory. Do not write canonical project notes from it. Do not start an updater or a watcher from this repository. Do not add secrets, host paths, or chat ids.
+This repository is a local Telegram export archiver. It is a vault archive, not chat memory. Do not write project notes or a task list from it. Do not commit an export, a vault, or a state database.
 
 ## Layout
 
 ```
 src/telescribe/
-  cli.py              Typer app: process, reprocess, review, status, validate
-  config.py           Pydantic config models; rejects secret-like YAML keys
-  telegram_parser.py  reads Telegram Desktop result.json and normalizes messages
-  pipeline.py         ArchiveService: plan, dry-run, commit
-  daily_archiver.py   renders one Markdown note per local day
-  state_store.py      SQLite message index (the checkpoint)
-  transaction.py      staged file replacement with rollback
-  models.py           immutable normalized message models
-  redaction.py        secret/PII redaction applied before anything is persisted
-  audit.py            per-run redacted audit records
-  intelligence.py     optional review-only queue and the single opt-in DeepSeek adapter (off by default)
-tests/                pytest suite; fixtures/ holds small synthetic exports
-docs/intelligence.md  the optional review step in detail
+  cli.py              validate, process, reprocess, status, review
+  config.py           config models; rejects secret-like YAML keys
+  telegram_parser.py  reads result.json
+  pipeline.py         plan, dry-run, commit
+  daily_archiver.py   one Markdown note per local day
+  state_store.py      SQLite index
+  paths.py            note paths and marker ranges
+  transaction.py      staged file replacement
+  models.py           normalized message models
+  redaction.py        opt-in archive redaction; logs stay redacted
+  audit.py            redacted audit records
+  intelligence.py     optional review queue, off by default
+tests/                pytest suite and synthetic fixtures
 ```
 
-## Run and test
+## Run
 
 ```bash
 uv sync --python 3.12
 uv run pytest
-PYTHONPATH=src python3.12 -m pytest     # offline fallback
 ```
 
-For manual runs, use a temporary `archive_root` and `state_path` and a synthetic export, such as the files in `tests/fixtures/`. Never point a test at a real vault, real exports or a real state database.
+Use a temporary vault, a temporary state file, and a synthetic export. Do not point a test at a real vault or a real export.
 
-## Conventions
+## Rules
 
-- The same input always gives the same output. Reprocessing an unchanged export must change nothing.
-- The SQLite index is the checkpoint. Never mark a message archived before its note is committed.
-- Never modify the source export. Redact before anything is persisted.
-- No network access by default. Remote review stays behind explicit config plus `--dispatch`.
-- Line length is 100 (ruff).
-- Behaviour changes need tests, plus an entry in the README's Change Log.
-
-## Secrets: never commit them
-
-- Never commit API keys (including `TELESCRIBE_DEEPSEEK_API_KEY`), bot tokens, `.env` files, real Telegram exports, state databases, archives, review queues or audit files.
-- Don't put real chat names, chat or user ids, phone numbers, emails or home paths in code, tests, fixtures or docs. Fixtures must stay synthetic.
-- Credentials come only from environment variables, never from YAML.
+- Keep archive text verbatim unless `archive_redaction` is set. Logs and model payloads stay redacted.
+- Prefer `date_unixtime`. A Desktop date with no timezone is used only when that field is missing and `export_timezone` is set.
+- A narrower export must not drop an indexed message. An untouched day is not rewritten.
+- Text outside `<!-- telescribe:BEGIN daily-records -->` and `<!-- telescribe:END daily-records -->` survives.
+- Do not modify the export. Do not add secrets, host paths, or chat ids.
+- Credentials come only from the environment, never from YAML.

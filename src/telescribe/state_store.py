@@ -10,6 +10,24 @@ from typing import Iterable
 from .models import NormalizedMessage
 
 
+def _edited_unixtime(message: NormalizedMessage) -> str | None:
+    value = message.original.get("edited_unixtime")
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int) or (isinstance(value, str) and value.isdecimal()):
+        return str(value)
+    return None
+
+
+def _content_hash(message: NormalizedMessage) -> str:
+    import hashlib
+    payload = "\x1f".join([
+        message.identity, message.timestamp_utc.isoformat(), message.plain_text,
+        _edited_unixtime(message) or "", json.dumps(message.original, sort_keys=True),
+    ])
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 @dataclass(frozen=True, slots=True)
 class IndexedMessage:
     identity: str
@@ -48,6 +66,11 @@ class StateStore:
             )
         """)
         self.connection.execute("CREATE INDEX IF NOT EXISTS messages_pending_date ON messages(archive_status, timestamp_local, source_chat_id, source_message_id)")
+        columns = {row[1] for row in self.connection.execute("PRAGMA table_info(messages)")}
+        if "content_hash" not in columns:
+            self.connection.execute("ALTER TABLE messages ADD COLUMN content_hash TEXT")
+        if "edited_unixtime" not in columns:
+            self.connection.execute("ALTER TABLE messages ADD COLUMN edited_unixtime TEXT")
         self.connection.commit()
 
     def _upsert_messages(self, messages: Iterable[NormalizedMessage], run_id: str) -> None:
@@ -57,14 +80,32 @@ class StateStore:
             item.sender, item.plain_text, item.markdown_text, json.dumps(item.entities, sort_keys=True),
             json.dumps(item.attachments), item.reply_to, item.forwarded_from,
             json.dumps(item.original, sort_keys=True), run_id,
+            _content_hash(item), _edited_unixtime(item),
         ) for item in messages]
         self.connection.executemany("""
             INSERT INTO messages (
               identity, source_chat_id, source_message_id, fingerprint, timestamp_utc, timestamp_local,
               local_date, sender, plain_text, markdown_text, entities_json, attachments_json, reply_to,
-              forwarded_from, original_json, run_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(identity) DO UPDATE SET run_id = excluded.run_id
+              forwarded_from, original_json, run_id, content_hash, edited_unixtime
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(identity) DO UPDATE SET
+              fingerprint = excluded.fingerprint,
+              timestamp_utc = excluded.timestamp_utc,
+              timestamp_local = excluded.timestamp_local,
+              local_date = excluded.local_date,
+              sender = excluded.sender,
+              plain_text = excluded.plain_text,
+              markdown_text = excluded.markdown_text,
+              entities_json = excluded.entities_json,
+              attachments_json = excluded.attachments_json,
+              reply_to = excluded.reply_to,
+              forwarded_from = excluded.forwarded_from,
+              original_json = excluded.original_json,
+              content_hash = excluded.content_hash,
+              edited_unixtime = excluded.edited_unixtime,
+              run_id = excluded.run_id
+            WHERE messages.content_hash IS NOT excluded.content_hash
+               OR messages.edited_unixtime IS NOT excluded.edited_unixtime
         """, rows)
 
     def upsert_messages(self, messages: Iterable[NormalizedMessage], run_id: str) -> None:

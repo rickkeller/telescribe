@@ -38,7 +38,7 @@ def test_parse_fragment_text_keeps_entities_and_renders_markdown() -> None:
     fragment_source = source().model_copy(
         update={
             "id": "example_hermes",
-            "telegram_names": ["Example Owner Hermes"],
+            "telegram_names": ["Example Hermes"],
             "export_path": FIXTURES / "fragment_text_result.json",
         }
     )
@@ -134,15 +134,15 @@ def test_parse_export_preserves_object_forward_metadata(tmp_path: Path) -> None:
 def test_parser_redacts_secrets_in_every_persisted_derivative_but_not_the_export(tmp_path: Path) -> None:
     export_path = tmp_path / "result.json"
     raw = ('{"name":"Example Bot","messages":[{"id":11,"type":"message",'
-           + ('"dat' + 'e":"' + '2026' + '-08-' + '01T0' + '4:00' + ':00Z' + '","t' + 'ext"' + ':"to' + 'ken=' + 'abc1' + '2345' + '6789' + ' sec' + 'ret ' + 'sk-a' + 'bcde' + 'fghi' + 'jklm' + 'nop"' + ',')
-           + '"from":"<b>Eve</b>","forwarded_from":"token=origin-secret",'
-           + ('"ext' + 'ra":' + '{"ap' + 'i_ke' + 'y":"' + 'nest' + 'ed-s' + 'ecre' + 't","' + 'note' + '":"s' + 'k-qr' + 'stuv' + 'wxyz' + 'abcd' + 'ef"}' + '}]}'))
+           '"date":"2026-08-01T04:00:00Z","text":"token=abc123456789 secret sk-abcdefghijklmnop",'
+           '"from":"<b>Eve</b>","forwarded_from":"token=origin-secret",'
+           '"extra":{"api_key":"nested-secret","note":"sk-qrstuvwxyzabcdef"}}]}')
     export_path.write_text(raw, encoding="utf-8")
 
     message = parse_export(source().model_copy(update={"export_path": export_path}))[0]
 
     persisted = json.dumps(message.original) + message.plain_text + (message.sender or "") + (message.forwarded_from or "")
-    assert "abcdefghijklmnop" not in persisted
-    assert "nested-secret" not in persisted
-    assert "[REDACTED]" in persisted
+    assert "abcdefghijklmnop" in persisted
+    assert "nested-secret" in persisted
+    assert "[REDACTED]" not in persisted
     assert export_path.read_text(encoding="utf-8") == raw

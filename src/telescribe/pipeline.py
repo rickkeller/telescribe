@@ -7,8 +7,9 @@ from pathlib import Path
 
 from .audit import new_run_id, redacted_error, utc_now, write_audit
 from .config import AppConfig
-from .daily_archiver import plan_daily_archives
+from .daily_archiver import plan_daily_archives, preserve_outside_markers, telegram_archive_output_root
 from .models import NormalizedMessage, message_id_sort_key
+from .paths import UnsafeArchivePathError, validate_archive_target
 from .state_store import StateStore
 from .telegram_parser import parse_export
 from .transaction import ArchiveTransaction
@@ -35,15 +36,51 @@ class ArchiveService:
         messages: list[NormalizedMessage] = []
         for source in self.config.sources:
             if source.enabled:
-                messages.extend(parse_export(source, self.config.timezone))
+                messages.extend(parse_export(source, self.config.timezone, archive_redaction=self.config.archive_redaction))
         identities = [message.identity for message in messages]
         if len(identities) != len(set(identities)):
             raise ValueError("duplicate normalized message identities in configured exports")
         return messages
 
+    def _days_to_write(self, messages: list[NormalizedMessage], pending: list[NormalizedMessage],
+                       indexed: list[NormalizedMessage]) -> list[NormalizedMessage]:
+        from .state_store import _content_hash
+        changed_dates = {message.local_date for message in pending}
+        indexed_by_id = {message.identity: message for message in indexed}
+        for message in messages:
+            prior = indexed_by_id.get(message.identity)
+            if prior is not None and _content_hash(prior) != _content_hash(message):
+                changed_dates.add(message.local_date)
+        export_by_date: dict[str, dict[str, NormalizedMessage]] = {}
+        indexed_by_date: dict[str, dict[str, NormalizedMessage]] = {}
+        for message in messages:
+            export_by_date.setdefault(message.local_date, {})[message.identity] = message
+        for message in indexed:
+            indexed_by_date.setdefault(message.local_date, {})[message.identity] = message
+        merged: list[NormalizedMessage] = []
+        for date in changed_dates:
+            day = dict(indexed_by_date.get(date, {}))
+            day.update(export_by_date.get(date, {}))
+            merged.extend(day.values())
+        return merged
+
+    def _planned_changes(self, plan: dict) -> dict[Path, str]:
+        changes: dict[Path, str] = {}
+        for archive in plan.values():
+            content = archive.content
+            if archive.target.exists():
+                content = preserve_outside_markers(archive.target.read_text(encoding="utf-8"), content)
+            changes[archive.target] = content
+        return changes
+
+    def _archive_root(self) -> Path:
+        """Return the validated canonical archive root for all archive I/O."""
+        return telegram_archive_output_root(self.config.archive_root).parents[1]
+
     def validate(self) -> int:
         """Validate enabled exports and archive/state parent accessibility without mutation."""
-        for path in (self.config.archive_root, self.config.state_path.parent):
+        archive_root = self._archive_root()
+        for path in (archive_root, self.config.state_path.parent):
             existing_parent = path
             while not existing_parent.exists() and existing_parent != existing_parent.parent:
                 existing_parent = existing_parent.parent
@@ -55,10 +92,12 @@ class ArchiveService:
         run_id = new_run_id() if not dry_run else None
         started_at = utc_now() if not dry_run else None
         try:
+            archive_root = self._archive_root()
             messages = self._messages()
             existing = self._existing_store(dry_run=dry_run)
             try:
                 archived = existing.archived_identities() if existing else set()
+                indexed = existing.archived_messages() if existing else []
             finally:
                 if existing:
                     existing.close()
@@ -66,17 +105,14 @@ class ArchiveService:
             if not pending:
                 result = ProcessResult(0, (), dry_run)
             else:
-                earliest = min(pending, key=lambda item: (
-                    item.timestamp_local, item.source_chat_id,
-                    message_id_sort_key(item.source_message_id, item.fingerprint), item.identity
-                ))
-                represented = [message for message in messages if message.local_date >= earliest.local_date]
+                represented = self._days_to_write(messages, pending, indexed)
                 plan = plan_daily_archives(
-                    represented, self.config.archive_root, datetime.now(UTC), {message.identity for message in pending}
+                    represented, archive_root, datetime.now(UTC), {message.identity for message in pending}
                 )
+                changes = self._planned_changes(plan)
                 if dry_run:
-                    intended_changes = tuple(archive.target for archive in plan.values() if not archive.target.exists()
-                                             or archive.target.read_text(encoding="utf-8") != archive.content)
+                    intended_changes = tuple(path for path, content in changes.items() if not path.exists()
+                                             or path.read_text(encoding="utf-8") != content)
                     return ProcessResult(len(pending), intended_changes, True)
 
                 self._stage_audit("process", run_id, started_at)
@@ -84,17 +120,20 @@ class ArchiveService:
                 def commit_state() -> None:
                     store = StateStore(self.config.state_path)
                     try:
-                        locations = {message.identity: (str(plan[message.local_date].target.relative_to(self.config.archive_root)), message.block_id)
+                        locations = {message.identity: (str(plan[message.local_date].target.relative_to(archive_root)), message.block_id)
                                      for message in pending}
                         store.checkpoint_archived(pending, locations, run_id=run_id or "dry-run")
                     finally:
                         store.close()
 
-                created = tuple(archive.target for archive in plan.values() if not archive.target.exists())
-                changed = ArchiveTransaction({archive.target: archive.content for archive in plan.values()}).commit(commit_state)
+                created = tuple(path for path in changes if not path.exists())
+                changed = ArchiveTransaction(
+                    changes,
+                    target_validator=lambda target: validate_archive_target(archive_root, target),
+                ).commit(commit_state)
                 result = ProcessResult(len(pending), tuple(changed), False)
         except Exception as error:
-            if not dry_run:
+            if not dry_run and not isinstance(error, UnsafeArchivePathError):
                 self._audit_failure("process", error, run_id, started_at)
             raise
         if not dry_run:
@@ -112,6 +151,7 @@ class ArchiveService:
             raise ValueError("source must be an enabled configured source id")
         run_id, started_at = new_run_id(), utc_now()
         try:
+            archive_root = self._archive_root()
             if not self.config.state_path.exists():
                 raise ValueError("cannot reprocess without an existing message index")
             store = StateStore(self.config.state_path, read_only=True)
@@ -129,13 +169,18 @@ class ArchiveService:
             if not messages:
                 raise ValueError("no indexed archived messages match the selection")
             processed_at = max(message.timestamp_utc for message in messages)
-            plan = plan_daily_archives(messages, self.config.archive_root, processed_at, set())
-            created = tuple(archive.target for archive in plan.values() if not archive.target.exists())
+            plan = plan_daily_archives(messages, archive_root, processed_at, set())
+            changes = self._planned_changes(plan)
+            created = tuple(path for path in changes if not path.exists())
             self._stage_audit("reprocess", run_id, started_at)
-            changed = ArchiveTransaction({archive.target: archive.content for archive in plan.values()}).commit(lambda: None)
+            changed = ArchiveTransaction(
+                changes,
+                target_validator=lambda target: validate_archive_target(archive_root, target),
+            ).commit(lambda: None)
             result = ReprocessResult(len(messages), tuple(changed))
         except Exception as error:
-            self._audit_failure("reprocess", error, run_id, started_at)
+            if not isinstance(error, UnsafeArchivePathError):
+                self._audit_failure("reprocess", error, run_id, started_at)
             raise
         self._audit_success("reprocess", result.message_count, result.changed_files,
                             dates=tuple(sorted(plan)), created=created, run_id=run_id, started_at=started_at)
@@ -178,8 +223,9 @@ class ArchiveService:
         run_id = run_id or new_run_id()
         started_at = started_at or utc_now()
         now = utc_now()
-        paths = [str(path.relative_to(self.config.archive_root)) for path in changed]
-        created_paths = [str(path.relative_to(self.config.archive_root)) for path in created if path in changed]
+        archive_root = self._archive_root()
+        paths = [str(path.relative_to(archive_root)) for path in changed]
+        created_paths = [str(path.relative_to(archive_root)) for path in created if path in changed]
         record = {"run_id": run_id, "started_at": started_at.isoformat(), "completed_at": now.isoformat(),
             "status": "success", "sources": len([source for source in self.config.sources if source.enabled]),
             "messages_scanned": message_count if messages_scanned is None else messages_scanned,

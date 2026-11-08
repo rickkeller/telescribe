@@ -1,6 +1,5 @@
 """Validated, local-only application configuration."""
 
-import os
 from pathlib import Path
 import re
 from typing import Any
@@ -9,22 +8,8 @@ from zoneinfo import ZoneInfo
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-
-def safe_canonical_root(value: Path, *, label: str) -> Path:
-    """Return a lexical absolute root only when no existing component is a symlink.
-
-    A configured root may not exist yet, but no existing component may be a
-    symlink.  That makes lexical containment checks authoritative without
-    resolving through an attacker-controlled alias.
-    """
-    root = value if value.is_absolute() else Path.cwd() / value
-    root = Path(os.path.abspath(root))
-    current = Path(root.anchor)
-    for part in root.parts[1:]:
-        current /= part
-        if current.is_symlink():
-            raise ValueError(f"unsafe {label} symlink")
-    return root
+from .daily_archiver import telegram_archive_output_root
+from .paths import safe_canonical_root
 
 
 class SourceConfig(BaseModel):
@@ -37,6 +22,7 @@ class SourceConfig(BaseModel):
     export_path: Path
     attachment_dir: Path
     enabled: bool = True
+    export_timezone: str | None = None
 
     @field_validator("id")
     @classmethod
@@ -65,6 +51,7 @@ class AppConfig(BaseModel):
     archive_root: Path
     state_path: Path = Path(".hermes-telegram-archive/state.sqlite3")
     timezone: str = "America/New_York"
+    archive_redaction: bool = False
     intelligence: "IntelligenceConfig" = Field(default_factory=lambda: IntelligenceConfig())
 
     @field_validator("timezone")
@@ -87,17 +74,20 @@ class AppConfig(BaseModel):
     @model_validator(mode="after")
     def review_queue_must_not_overlap_archive(self) -> "AppConfig":
         archive = safe_canonical_root(self.archive_root, label="archive_root")
+        output = telegram_archive_output_root(archive)
         root = self.intelligence.review_queue_root
+        queue: Path | None = None
         if root is not None:
             queue = safe_canonical_root(root, label="review_queue_root")
-            if archive == queue or archive in queue.parents or queue in archive.parents:
+            if not _queue_allowed(archive, output, queue):
                 raise ValueError("review_queue_root and archive_root must not overlap")
         context = self.intelligence.project_context_root
         if context is not None:
             context_root = safe_canonical_root(context, label="project_context_root")
-            if (archive == context_root or archive in context_root.parents
-                    or context_root in archive.parents):
+            if context_root == archive or _roots_overlap(context_root, output):
                 raise ValueError("project_context_root and archive_root overlap")
+            if queue is not None and _roots_overlap(queue, context_root):
+                raise ValueError("review_queue_root and project_context_root must not overlap")
         return self
 
 
@@ -157,6 +147,16 @@ class IntelligenceConfig(BaseModel):
         if len(aliases) != len(set(aliases)):
             raise ValueError("project aliases must be unique across projects")
         return self
+
+def _queue_allowed(archive: Path, output: Path, queue: Path) -> bool:
+    if queue == archive or queue in archive.parents:
+        return False
+    return not (queue == output or output in queue.parents or queue in output.parents)
+
+
+def _roots_overlap(first: Path, second: Path) -> bool:
+    return first == second or first in second.parents or second in first.parents
+
 
 def load_config(path: Path) -> AppConfig:
     """Load YAML config without resolving relative paths prematurely."""

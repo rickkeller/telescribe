@@ -64,9 +64,10 @@ def test_direct_provider_uses_fixed_url_model_and_minimal_redacted_payload(tmp_p
     proposal = {"source_identity": "test_source:42", "source_chat_id": "test_source", "timestamp_utc": "2026-08-01T03:30:00+00:00",
         "archive_block_id": "tg-test-source-42", "project": "alpha", "proposal_type": "task", "confidence": 0.8,
         "rationale": "Follow up", "proposed_text": "Follow up", "model_run": "deepseek", "possible_duplicate": False,
-        "possible_contradiction": False, "needs_review": True}
+        "possible_contradiction": False, "needs_review": True, "temporal_status": "current", "context_conflict": False, "version_relation": None,
+        "related_proposal_key": None, "related_source_identity": None}
     transport = FakeTransport(body=json.dumps({"choices": [{"message": {"content": json.dumps({"proposals": [proposal]})}}]}).encode())
-    classifier = _create_direct_deepseek_classifier_for_test(_config(tmp_path), api_key="example", transport=transport)
+    classifier = _create_direct_deepseek_classifier_for_test(_config(tmp_path), api_key="test-key", transport=transport)
     assert list(classifier.classify(_evidence(), (_RetrievedContext("project plan", Path("brief.md")),))) == [proposal]
     url, headers, raw, timeout = transport.calls[0]
     payload = json.loads(raw)
@@ -74,7 +75,7 @@ def test_direct_provider_uses_fixed_url_model_and_minimal_redacted_payload(tmp_p
     assert payload["model"] == "deepseek-v4-flash" and headers["Content-Type"] == "application/json"
     assert timeout > 0 and "Authorization" in headers
     user = json.loads(payload["messages"][1]["content"])
-    assert user["request_version"] == "telescribe-review-v1"
+    assert user["request_version"] == "telescribe-review-v2"
     assert set(user) == {"request_version", "task", "project_ids", "proposal_types", "evidence", "project_context"}
     assert "archive_path" not in json.dumps(user)
     assert "project plan" in user["project_context"]
@@ -87,7 +88,7 @@ def test_direct_provider_uses_fixed_url_model_and_minimal_redacted_payload(tmp_p
     (200, b"x" * (_DirectDeepSeekClassifier.MAX_RESPONSE_BYTES + 1)),
 ])
 def test_direct_provider_rejects_bad_responses_without_exposing_body(tmp_path: Path, status: int, body: bytes) -> None:
-    classifier = _create_direct_deepseek_classifier_for_test(_config(tmp_path), api_key="example", transport=FakeTransport(status=status, body=body))
+    classifier = _create_direct_deepseek_classifier_for_test(_config(tmp_path), api_key="test-key", transport=FakeTransport(status=status, body=body))
     with pytest.raises(ModelTransportError):
         list(classifier.classify(_evidence(), ()))
 
@@ -104,12 +105,37 @@ def test_direct_response_flows_through_existing_safe_queue_boundary(tmp_path: Pa
     proposal = {"source_identity": "test_source:42", "source_chat_id": "test_source", "timestamp_utc": "2026-08-01T03:30:00+00:00",
         "archive_block_id": "tg-test-source-42", "project": "alpha", "proposal_type": "task", "confidence": 0.8,
         "rationale": "Follow up", "proposed_text": "Follow up", "model_run": "deepseek", "possible_duplicate": False,
-        "possible_contradiction": False, "needs_review": True}
+        "possible_contradiction": False, "needs_review": True, "temporal_status": "current", "context_conflict": False, "version_relation": None,
+        "related_proposal_key": None, "related_source_identity": None}
     body = json.dumps({"choices": [{"message": {"content": json.dumps({"proposals": [proposal]})}}]}).encode()
-    result = ReviewService(config, _create_direct_deepseek_classifier_for_test(config, api_key="example", transport=FakeTransport(body=body))).review(all_dates=True)
+    result = ReviewService(config, _create_direct_deepseek_classifier_for_test(config, api_key="test-key", transport=FakeTransport(body=body))).review(all_dates=True)
     assert result.accepted_count == 1
     assert "Follow up" in (tmp_path / "review" / "2026-08-01.md").read_text(encoding="utf-8")
     assert list((tmp_path / "review" / "audit").glob("*.json"))
+
+
+def test_direct_provider_never_receives_generated_archive_content_via_nested_context_alias(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    ArchiveService(config).process()
+    archive_note = next(config.archive_root.rglob("*.md"))
+    context = config.intelligence.project_context_root
+    assert context is not None
+    generated_alias = context / "2026-99" / "generated.md"
+    generated_alias.parent.mkdir(parents=True)
+    generated_alias.write_text(archive_note.read_text(encoding="utf-8"), encoding="utf-8")
+    unsafe = config.model_copy(update={"intelligence": config.intelligence.model_copy(update={
+        "projects": [ProjectConfig(id="alpha", context_paths=[Path("2026-99/generated.md")])],
+    })})
+    month = unsafe.archive_root / "01 Daily Archives" / "Telegram" / "2026" / "2026-99"
+    month.symlink_to(context / "2026-99", target_is_directory=True)
+    transport = FakeTransport()
+    classifier = _create_direct_deepseek_classifier_for_test(unsafe, api_key="test-key", transport=transport)
+
+    with pytest.raises(ValueError, match="unsafe archive tree symlink"):
+        ReviewService(unsafe, classifier).review(all_dates=True)
+
+    assert not transport.calls
+    assert not (tmp_path / "review").exists()
 
 
 @pytest.mark.parametrize("failure", [TimeoutError(), OSError("no route")])
@@ -119,7 +145,7 @@ def test_direct_failure_mutates_no_queue_or_audit(tmp_path: Path, failure: Excep
     def raising_transport(url, headers, body, timeout):
         raise failure
     with pytest.raises(ModelTransportError):
-        ReviewService(config, _create_direct_deepseek_classifier_for_test(config, api_key="example", transport=raising_transport)).review(all_dates=True)
+        ReviewService(config, _create_direct_deepseek_classifier_for_test(config, api_key="test-key", transport=raising_transport)).review(all_dates=True)
     assert not (tmp_path / "review").exists()
 
 
@@ -136,7 +162,7 @@ def test_remote_context_file_classes_fail_closed_before_transport_or_writes(tmp_
     })})
     ArchiveService(config).process()
     transport = FakeTransport()
-    classifier = _create_direct_deepseek_classifier_for_test(config, api_key="example", transport=transport)
+    classifier = _create_direct_deepseek_classifier_for_test(config, api_key="test-key", transport=transport)
     with pytest.raises(ModelTransportError, match="payload rejected"):
         ReviewService(config, classifier).review(all_dates=True)
     assert not transport.calls
@@ -166,7 +192,7 @@ def test_remote_adversarial_outbound_text_fails_closed_before_transport_or_write
         with sqlite3.connect(config.state_path) as connection:
             connection.execute("UPDATE messages SET plain_text = ?", (value,))
     transport = FakeTransport()
-    classifier = _create_direct_deepseek_classifier_for_test(config, api_key="example", transport=transport)
+    classifier = _create_direct_deepseek_classifier_for_test(config, api_key="test-key", transport=transport)
     with pytest.raises(ModelTransportError, match="payload rejected"):
         ReviewService(config, classifier).review(all_dates=True)
     assert not transport.calls

@@ -11,6 +11,11 @@ from pathlib import Path
 from typing import Iterable
 
 from .models import NormalizedMessage, message_id_sort_key
+from .paths import telegram_archive_output_root as _telegram_archive_output_root, validate_archive_target
+
+
+RECORDS_BEGIN = "<!-- telescribe:BEGIN daily-records -->"
+RECORDS_END = "<!-- telescribe:END daily-records -->"
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,9 +26,20 @@ class DailyArchive:
     messages: tuple[NormalizedMessage, ...]
 
 
+def telegram_archive_output_root(archive_root: Path) -> Path:
+    """Return the safe, deterministic root containing generated Telegram archives.
+
+    The output directories may be absent for a new archive, but an existing
+    component must never be a symlink: it would redirect generated material
+    outside the lexical vault boundary used by review/context protections.
+    """
+    return _telegram_archive_output_root(archive_root)
+
+
 def _target(root: Path, date: str) -> Path:
     year, month, _ = date.split("-")
-    return root / "01 Daily Archives" / "Telegram" / year / f"{year}-{month}" / f"{date}.md"
+    output = telegram_archive_output_root(root)
+    return validate_archive_target(root, output / year / f"{year}-{month}" / f"{date}.md")
 
 
 def _render_message(message: NormalizedMessage) -> str:
@@ -104,9 +120,22 @@ def _render_day(date: str, messages: tuple[NormalizedMessage, ...], processed_at
         "",
         "## Complete Conversation Records",
         "",
+        RECORDS_BEGIN,
         records.rstrip(),
+        RECORDS_END,
         "",
     ])
+
+
+def preserve_outside_markers(existing: str, generated: str) -> str:
+    """Keep hand edits outside the generated records markers."""
+    begin = existing.find(RECORDS_BEGIN)
+    end = existing.find(RECORDS_END)
+    new_begin = generated.find(RECORDS_BEGIN)
+    new_end = generated.find(RECORDS_END)
+    if begin < 0 or end < begin or new_begin < 0 or new_end < new_begin:
+        return generated
+    return existing[:begin] + generated[new_begin:new_end + len(RECORDS_END)] + existing[end + len(RECORDS_END):]
 
 
 def plan_daily_archives(messages: Iterable[NormalizedMessage], archive_root: Path,
@@ -131,12 +160,23 @@ def write_daily_archives(plan: dict[str, DailyArchive]) -> list[Path]:
     """Atomically write a fully prepared plan. Callers own state checkpointing."""
     changed: list[Path] = []
     for archive in plan.values():
-        if archive.target.exists() and archive.target.read_text(encoding="utf-8") == archive.content:
+        archive_root = archive.target.parents[4]
+        target = validate_archive_target(archive_root, archive.target)
+        if target.exists() and target.read_text(encoding="utf-8") == archive.content:
             continue
-        archive.target.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=archive.target.parent, delete=False) as temp:
-            temp.write(archive.content)
+        content = archive.content
+        if target.exists():
+            content = preserve_outside_markers(target.read_text(encoding="utf-8"), archive.content)
+            if content == target.read_text(encoding="utf-8"):
+                continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target = validate_archive_target(archive_root, target)
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=target.parent, delete=False) as temp:
+            temp.write(content)
             temporary = Path(temp.name)
-        os.replace(temporary, archive.target)
-        changed.append(archive.target)
+        # Recheck immediately before the replacement in case planning raced a
+        # filesystem alias change.
+        target = validate_archive_target(archive_root, target)
+        os.replace(temporary, target)
+        changed.append(target)
     return changed

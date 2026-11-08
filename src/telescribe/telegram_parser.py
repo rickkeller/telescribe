@@ -44,11 +44,29 @@ def _render_text(value: Any) -> tuple[str, str, tuple[dict[str, Any], ...]]:
     return "".join(plain), "".join(markdown), tuple(entities)
 
 
-def _parse_timestamp(raw: Any) -> datetime:
-    if not isinstance(raw, str):
-        raise ValueError("Telegram message has no valid date")
-    parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+def _unix_timestamp(value: object) -> datetime | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int) or (isinstance(value, str) and value.isdecimal()):
+        return datetime.fromtimestamp(int(value), UTC)
+    return None
+
+
+def _parse_timestamp(raw: dict[str, Any], export_timezone: str | None) -> datetime:
+    """Prefer date_unixtime. A naive Desktop date is exporter-local, not UTC."""
+    parsed = _unix_timestamp(raw.get("date_unixtime"))
+    if parsed is not None:
+        return parsed
+    date = raw.get("date")
+    message_id = raw.get("id", "unknown")
+    if not isinstance(date, str):
+        raise ValueError(f"message {message_id} has no date_unixtime")
+    wall = datetime.fromisoformat(date.replace("Z", "+00:00"))
+    if wall.tzinfo is None:
+        if not export_timezone:
+            raise ValueError(f"message {message_id} has a local date and no export_timezone")
+        wall = wall.replace(tzinfo=ZoneInfo(export_timezone))
+    return wall.astimezone(UTC)
 
 
 def _attachments(message: dict[str, Any]) -> tuple[str, ...]:
@@ -78,7 +96,8 @@ def _fingerprint(source_id: str, timestamp: datetime, sender: str | None, text: 
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
-def parse_export(source: SourceConfig, timezone: str = "America/New_York") -> list[NormalizedMessage]:
+def parse_export(source: SourceConfig, timezone: str = "America/New_York",
+                 *, archive_redaction: bool = False) -> list[NormalizedMessage]:
     """Read an export without modifying it and normalize supported message records."""
     with Path(source.export_path).open("r", encoding="utf-8") as export_file:
         export = json.load(export_file)
@@ -94,8 +113,8 @@ def parse_export(source: SourceConfig, timezone: str = "America/New_York") -> li
             continue
         # The raw export is never changed.  From this point on, all derived,
         # persisted representations use the same redacted copy.
-        persisted_raw = redact(raw)
-        timestamp_utc = _parse_timestamp(persisted_raw.get("date"))
+        persisted_raw = redact(raw) if archive_redaction else dict(raw)
+        timestamp_utc = _parse_timestamp(persisted_raw, source.export_timezone)
         plain, markdown, entities = _render_text(persisted_raw.get("text", ""))
         if not plain and not markdown and "caption" in persisted_raw:
             plain, markdown, entities = _render_text(persisted_raw["caption"])

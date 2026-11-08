@@ -13,7 +13,7 @@ def message(identity: str, hour: int, text: str) -> NormalizedMessage:
     return NormalizedMessage(
         source_chat_id="example_bot", identity=identity, source_message_id=identity.rsplit(":", 1)[1],
         fingerprint="a" * 64, timestamp_utc=instant, timestamp_local=instant.astimezone(ZoneInfo("America/New_York")),
-        sender="Rick", plain_text=text, markdown_text=text, entities=(), attachments=(), reply_to=None,
+        sender="Ada", plain_text=text, markdown_text=text, entities=(), attachments=(), reply_to=None,
         forwarded_from=None, original={"id": identity},
     )
 
